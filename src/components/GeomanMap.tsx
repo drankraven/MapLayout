@@ -6,6 +6,14 @@ import '@geoman-io/leaflet-geoman-free';
 import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css';
 import { kml } from '@tmcw/togeojson';
 import { resolveTileSource, normalizeTileUrl, getTileSourceFromCatalog } from '../lib/tileSources';
+import { normalizeGeoJsonInput } from '../lib/geojsonUtils';
+import {
+  createClosedLineFillFeatureCollection,
+  createImportedFeatureStyle,
+  createImportedPointStyle,
+} from '../lib/vectorLayerStyle';
+import { applyVectorTextStyle } from '../lib/vectorTextStyle';
+import type { FeatureCollection } from 'geojson';
 
 // @ts-ignore
 import icon from 'leaflet/dist/images/marker-icon.png';
@@ -34,71 +42,92 @@ interface GeomanMapProps {
   onScaleUpdate?: (scaleData: { meters: number, widthInPx: number }) => void;
 }
 
-const KmlLayerRenderer: React.FC<{ layer: LayerConfig }> = ({ layer }) => {
+const getLegacyKmlGeoJson = (kmlData?: string): FeatureCollection | null => {
+  if (!kmlData) return null;
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(kmlData, 'text/xml');
+  return normalizeGeoJsonInput(kml(doc));
+};
+
+const GeoJsonDataLayerRenderer: React.FC<{ layer: LayerConfig }> = ({ layer }) => {
   const map = useMap();
-  const layerRef = useRef<L.GeoJSON | null>(null);
+  const layerRef = useRef<L.FeatureGroup | null>(null);
+  const hasLoadedBoundsRef = useRef(false);
 
   useEffect(() => {
-    if (!layer.visible) {
+    if (layerRef.current) {
+      map.removeLayer(layerRef.current);
+      layerRef.current = null;
+    }
+
+    if (!layer.visible) return;
+
+    try {
+      const geojson = layer.geojsonData || getLegacyKmlGeoJson(layer.kmlData);
+      if (!geojson) return;
+
+      const styleOptions = {
+        color: layer.vectorStyle?.color || layer.color || 'red',
+        fillColor: layer.vectorStyle?.fillColor || layer.color || 'red',
+        weight: layer.vectorStyle?.weight || 3,
+        fillOpacity: layer.vectorStyle?.fillOpacity ?? 0.4,
+        fillEnabled: Boolean(layer.isClosedKml),
+      };
+      const getStyle = (feature?: GeoJSON.Feature): L.PathOptions => (
+        createImportedFeatureStyle(feature?.geometry, styleOptions)
+      );
+
+      const featureGroup = L.featureGroup().addTo(map);
+      const closedLineFillGeojson = styleOptions.fillEnabled
+        ? createClosedLineFillFeatureCollection(geojson)
+        : null;
+
+      if (closedLineFillGeojson && closedLineFillGeojson.features.length > 0) {
+        L.geoJSON(closedLineFillGeojson, {
+          style: (feature?: GeoJSON.Feature): L.PathOptions => ({
+            ...createImportedFeatureStyle(feature?.geometry, styleOptions),
+            stroke: false,
+          }),
+        }).addTo(featureGroup);
+      }
+
+      L.geoJSON(geojson, {
+        style: getStyle,
+        pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
+          ...createImportedPointStyle({
+            ...styleOptions,
+            fillOpacity: layer.vectorStyle?.fillOpacity ?? 0.7,
+          }),
+        }),
+      }).addTo(featureGroup);
+
+      layerRef.current = featureGroup;
+
+      const bounds = featureGroup.getBounds();
+      if (bounds.isValid()) {
+        const el = document.getElementById(`layer-${layer.id}`);
+        if (el) {
+          el.dataset.lat1 = bounds.getSouthWest().lat.toString();
+          el.dataset.lng1 = bounds.getSouthWest().lng.toString();
+          el.dataset.lat2 = bounds.getNorthEast().lat.toString();
+          el.dataset.lng2 = bounds.getNorthEast().lng.toString();
+        }
+        if (!hasLoadedBoundsRef.current) {
+          map.fitBounds(bounds);
+          hasLoadedBoundsRef.current = true;
+        }
+      }
+    } catch (error) {
+      console.error("Error rendering GeoJSON data layer:", error);
+    }
+
+    return () => {
       if (layerRef.current) {
         map.removeLayer(layerRef.current);
         layerRef.current = null;
       }
-      return;
-    }
-
-    if (layer.kmlData && !layerRef.current) {
-      try {
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(layer.kmlData, 'text/xml');
-        const geojson = kml(doc);
-
-        const geojsonLayer = L.geoJSON(geojson, {
-          style: {
-            color: layer.vectorStyle?.color || layer.color || 'red',
-            weight: layer.vectorStyle?.weight || 3,
-            fillColor: layer.vectorStyle?.fillColor || layer.color || 'red',
-            fillOpacity: layer.isClosedKml ? (layer.vectorStyle?.fillOpacity ?? 0.4) : 0,
-            fill: layer.isClosedKml
-          }
-        }).addTo(map);
-
-        layerRef.current = geojsonLayer;
-
-        const bounds = geojsonLayer.getBounds();
-        if (bounds.isValid()) {
-          const el = document.getElementById(`layer-${layer.id}`);
-          if (el) {
-            el.dataset.lat1 = bounds.getSouthWest().lat.toString();
-            el.dataset.lng1 = bounds.getSouthWest().lng.toString();
-            el.dataset.lat2 = bounds.getNorthEast().lat.toString();
-            el.dataset.lng2 = bounds.getNorthEast().lng.toString();
-          }
-          if (!(layer as any)._hasLoadedBounds) {
-             map.fitBounds(bounds);
-             (layer as any)._hasLoadedBounds = true;
-          }
-        }
-      } catch (error) {
-        console.error("Error parsing KML:", error);
-      }
-    } else if (layerRef.current) {
-      layerRef.current.setStyle({
-        color: layer.vectorStyle?.color || layer.color || 'red',
-        weight: layer.vectorStyle?.weight || 3,
-        fillColor: layer.vectorStyle?.fillColor || layer.color || 'red',
-        fillOpacity: layer.isClosedKml ? (layer.vectorStyle?.fillOpacity ?? 0.4) : 0,
-        fill: layer.isClosedKml
-      });
-    }
-
-    return () => {
-      if (layerRef.current && !layer.visible) {
-        map.removeLayer(layerRef.current);
-        layerRef.current = null;
-      }
     };
-  }, [layer.kmlData, layer.visible, layer.color, layer.isClosedKml, layer.vectorStyle, map]);
+  }, [layer.geojsonData, layer.kmlData, layer.visible, layer.color, layer.isClosedKml, layer.vectorStyle, map, layer.id]);
 
   useEffect(() => {
     const handler = (e: any) => {
@@ -112,7 +141,6 @@ const KmlLayerRenderer: React.FC<{ layer: LayerConfig }> = ({ layer }) => {
 
   return <div id={`layer-${layer.id}`} style={{ display: 'none' }} />;
 };
-
 const GeomanSetup = ({
   layers,
   onVectorCreated,
@@ -253,58 +281,13 @@ const GeomanSetup = ({
           if (l.shape === 'Text' && l.textStyle) {
             const el = vLayer.pm?.getElement?.();
             if (el) {
-              el.style.color = l.textStyle.color;
-              el.style.backgroundColor = l.textStyle.backgroundColor === 'transparent' ? 'transparent' : l.textStyle.backgroundColor;
-              el.style.fontSize = l.textStyle.fontSize + 'px';
-              el.style.fontFamily = l.textStyle.fontFamily;
-              el.style.fontWeight = l.textStyle.fontWeight;
-              el.style.textAlign = l.textStyle.textAlign || 'left';
-              el.style.padding = (l.textStyle.padding || 0) + 'px';
-              if (l.textStyle.multiline) {
-                el.setAttribute('wrap', 'soft');
-                el.style.whiteSpace = 'pre-wrap';
-                el.style.wordBreak = 'break-word';
-              } else {
-                el.setAttribute('wrap', 'off');
-                el.style.whiteSpace = 'pre';
-                el.style.wordBreak = 'normal';
-              }
-              if (l.textStyle.text !== undefined && el.value !== l.textStyle.text) {
-                vLayer.pm?.setText?.(l.textStyle.text);
-              }
-              if (l.textStyle.boxWidth !== undefined) {
-                el.style.width = l.textStyle.boxWidth + 'px';
-                el.style.minWidth = l.textStyle.boxWidth + 'px';
-                el.dataset.boxWidth = String(l.textStyle.boxWidth);
-              } else {
-                el.style.width = '';
-                el.style.minWidth = '';
-                delete el.dataset.boxWidth;
-              }
-              if (l.textStyle.boxHeight !== undefined) {
-                el.style.height = l.textStyle.boxHeight + 'px';
-                el.style.minHeight = l.textStyle.boxHeight + 'px';
-                el.dataset.boxHeight = String(l.textStyle.boxHeight);
-              } else {
-                el.style.height = '';
-                el.style.minHeight = '';
-                delete el.dataset.boxHeight;
-              }
-            }
-            // Rotation on textarea (not icon wrapper, which is positioned by Leaflet transform)
-            el.style.transform = `rotate(${l.textStyle.rotation || 0}deg)`;
-            el.style.transformOrigin = 'center center';
-            // Fix zoom scaling: set explicit iconSize so Leaflet uses fixed px values, not recalculating during zoom
-            const icon = vLayer._icon as HTMLElement;
-            if (icon) {
-              const cw = (l.textStyle.boxWidth || el.offsetWidth || 60);
-              const ch = (l.textStyle.boxHeight || el.offsetHeight || 20);
-              icon.style.width = cw + 'px';
-              icon.style.height = ch + 'px';
-              if (vLayer.options.icon?.options) {
-                vLayer.options.icon.options.iconSize = [cw, ch];
-                vLayer.options.icon.options.iconAnchor = [cw / 2, ch / 2];
-              }
+              applyVectorTextStyle({
+                element: el,
+                icon: vLayer._icon as HTMLElement | undefined,
+                iconOptions: vLayer.options.icon?.options,
+                setText: (text) => vLayer.pm?.setText?.(text),
+                textStyle: l.textStyle,
+              });
             }
           } else if (l.vectorStyle && vLayer.setStyle) {
             vLayer.setStyle(l.vectorStyle);
@@ -449,8 +432,8 @@ export const GeomanMap: React.FC<GeomanMapProps> = ({ layers, isExporting, updat
               />
             );
           }
-          if (layer.type === 'kml' && layer.kmlData) {
-             return <KmlLayerRenderer key={layer.id} layer={layer} />;
+          if (layer.type === 'kml' && (layer.geojsonData || layer.kmlData)) {
+             return <GeoJsonDataLayerRenderer key={layer.id} layer={layer} />;
           }
           return null;
         })}

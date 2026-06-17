@@ -3,7 +3,13 @@ import { GeomanMap } from './components/GeomanMap';
 import { CompassArrow } from './components/CompassArrow';
 import { TileSourceManager } from './components/TileSourceManager';
 import { getTileSourceFromCatalog } from './lib/tileSources';
-import { Download, Upload, Settings, Layers, Monitor, RotateCcw, Trash2, Edit3, Eye, EyeOff, Type, Compass, Box, ChevronUp, ChevronDown, Map as MapIcon, PlusSquare } from 'lucide-react';
+import { calculateFeatureCollectionBounds, normalizeGeoJsonInput, type GeoJsonBounds } from './lib/geojsonUtils';
+import { importShapefileZip, type DbfEncodingMode } from './lib/shapefileImport';
+import type { DetectedProjection, ShapefileProjectionMode } from './lib/coordinateSystems';
+import { createProjectFile, parseProjectFile } from './lib/projectFile';
+import { kml } from '@tmcw/togeojson';
+import type { FeatureCollection } from 'geojson';
+import { Download, Upload, Save, FolderOpen, Settings, Layers, Monitor, RotateCcw, Trash2, Edit3, Eye, EyeOff, Type, Compass, Box, ChevronUp, ChevronDown, Map as MapIcon, PlusSquare } from 'lucide-react';
 
 import { Rnd } from 'react-rnd';
 
@@ -32,6 +38,11 @@ export interface LayerConfig {
 
   // kml properties
   kmlData?: string;
+  sourceType?: 'kml' | 'geojson' | 'shapefile' | 'draw';
+  geojsonData?: FeatureCollection;
+  bounds?: GeoJsonBounds | null;
+  sourceProjection?: DetectedProjection;
+  dbfEncoding?: string;
   color?: string; // fallback color for kml
   isClosedKml?: boolean;
   
@@ -216,10 +227,36 @@ const getInitialCustomSources = (): { name: string, url: string }[] => {
   return [];
 };
 
+const getInitialLayoutSize = () => {
+  const saved = localStorage.getItem('geoman_map_layout_size');
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved);
+      const preset = PAGE_SIZES.find(size => size.id === parsed.id);
+      if (preset) {
+        return {
+          ...preset,
+          w: typeof parsed.w === 'number' ? parsed.w : preset.w,
+          h: typeof parsed.h === 'number' ? parsed.h : preset.h,
+          label: typeof parsed.label === 'string' ? parsed.label : preset.label,
+        };
+      }
+    } catch (e) {
+      console.error('Failed to parse saved layout size', e);
+    }
+  }
+  return PAGE_SIZES[3];
+};
+
+const clampCanvasSize = (value: number) => Math.min(6000, Math.max(300, Math.round(value)));
+
+const getCustomLayoutLabel = (w: number, h: number) => `自定义 (${w}x${h})`;
+
 export default function App() {
-  const [layoutSize, setLayoutSize] = useState(PAGE_SIZES[3]);
+  const [layoutSize, setLayoutSize] = useState(getInitialLayoutSize);
   const [isExporting, setIsExporting] = useState(false);
   const layoutRef = useRef<HTMLDivElement>(null);
+  const projectFileInputRef = useRef<HTMLInputElement>(null);
   const [mapScale, setMapScale] = useState({ meters: 100, widthInPx: 100 });
 
   const [layers, setLayers] = useState<LayerConfig[]>(getInitialLayers);
@@ -227,6 +264,8 @@ export default function App() {
 
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
   const [isSourceManagerOpen, setIsSourceManagerOpen] = useState(false);
+  const [shapefileProjection, setShapefileProjection] = useState<ShapefileProjectionMode>('auto');
+  const [shapefileEncoding, setShapefileEncoding] = useState<DbfEncodingMode>('auto');
 
   useEffect(() => {
     localStorage.setItem('geoman_map_layers', JSON.stringify(layers));
@@ -235,6 +274,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('geoman_custom_sources', JSON.stringify(customSources));
   }, [customSources]);
+
+  useEffect(() => {
+    localStorage.setItem('geoman_map_layout_size', JSON.stringify(layoutSize));
+  }, [layoutSize]);
 
   useEffect(() => {
     const handler = (e: CustomEvent) => {
@@ -319,35 +362,86 @@ export default function App() {
     setLayers(newLayers);
   };
 
-  const handleKmlUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-      const file = e.target.files[0];
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const text = event.target?.result as string;
-        if (!text) return;
-        const newLayer: LayerConfig = {
-          id: `kml-${Date.now()}`,
-          name: file.name,
-          visible: true,
-          type: 'kml',
-          kmlData: text,
-          color: '#ff0000',
-          isClosedKml: false,
-          vectorStyle: {
-            color: '#ff0000',
-            fillColor: '#ff0000',
-            weight: 3,
-            fillOpacity: 0.4
-          }
-        };
+  const createImportedDataLayer = (
+    name: string,
+    sourceType: 'kml' | 'geojson' | 'shapefile',
+    geojsonData: FeatureCollection,
+    index = 0,
+    metadata: Pick<LayerConfig, 'sourceProjection' | 'dbfEncoding'> = {},
+  ): LayerConfig => {
+    const id = `${sourceType}-${Date.now()}-${index}`;
+    return {
+      id,
+      name,
+      visible: true,
+      type: 'kml',
+      sourceType,
+      geojsonData,
+      bounds: calculateFeatureCollectionBounds(geojsonData),
+      sourceProjection: metadata.sourceProjection,
+      dbfEncoding: metadata.dbfEncoding,
+      color: '#ff0000',
+      isClosedKml: true,
+      vectorStyle: {
+        color: '#ff0000',
+        fillColor: '#ff0000',
+        weight: 3,
+        fillOpacity: 0.25
+      }
+    };
+  };
+
+  const handleDataUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const lowerName = file.name.toLowerCase();
+
+      if (lowerName.endsWith('.kml')) {
+        const text = await file.text();
+        const doc = new DOMParser().parseFromString(text, 'text/xml');
+        if (doc.querySelector('parsererror')) {
+          throw new Error('KML 文件 XML 解析失败');
+        }
+        const geojsonData = normalizeGeoJsonInput(kml(doc));
+        const newLayer = createImportedDataLayer(file.name, 'kml', geojsonData);
         setLayers(prev => [newLayer, ...prev]);
         setActiveItemId(newLayer.id);
-      };
-      reader.readAsText(file);
+        return;
+      }
+
+      if (lowerName.endsWith('.geojson') || lowerName.endsWith('.json')) {
+        const geojsonData = normalizeGeoJsonInput(JSON.parse(await file.text()));
+        const newLayer = createImportedDataLayer(file.name, 'geojson', geojsonData);
+        setLayers(prev => [newLayer, ...prev]);
+        setActiveItemId(newLayer.id);
+        return;
+      }
+
+      if (lowerName.endsWith('.zip')) {
+        const importedLayers = await importShapefileZip(file, {
+          dbfEncoding: shapefileEncoding,
+          projection: shapefileProjection,
+        });
+        const newLayers = importedLayers.map((item, index) => (
+          createImportedDataLayer(item.name, 'shapefile', item.geojsonData, index, {
+            sourceProjection: item.detectedProjection,
+            dbfEncoding: item.dbfEncoding,
+          })
+        ));
+        setLayers(prev => [...newLayers, ...prev]);
+        setActiveItemId(newLayers[0]?.id || null);
+        return;
+      }
+
+      alert('暂不支持该文件格式，请选择 KML、GeoJSON 或 Shapefile zip。');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '未知错误';
+      alert(`导入失败：${message}`);
+    } finally {
+      e.target.value = '';
     }
-    // reset input so it can be re-selected
-    e.target.value = '';
   };
 
   const exportAsImage = useCallback(async () => {
@@ -432,6 +526,48 @@ export default function App() {
     }
   }, []);
 
+  const saveProject = () => {
+    const project = createProjectFile({ layers, layoutSize });
+    const blob = new Blob([JSON.stringify(project, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `MapLayout_Project_${new Date().toISOString().replace(/[:.]/g, '-')}.maplayout.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleProjectUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const project = parseProjectFile(await file.text());
+      setLayers(project.layers as LayerConfig[]);
+      setLayoutSize(project.layoutSize);
+      setActiveItemId((project.layers as LayerConfig[])[0]?.id ?? null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '未知错误';
+      alert(`打开工程失败：${message}`);
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const resetProject = () => {
+    if (!window.confirm('确定要重置当前工程吗？当前图层和画布设置会恢复为默认值。')) return;
+    localStorage.removeItem('geoman_map_layers');
+    localStorage.removeItem('geoman_map_layout_size');
+    localStorage.removeItem('geoman_custom_sources');
+    const nextLayers = getInitialLayers();
+    const nextLayoutSize = getInitialLayoutSize();
+    const nextCustomSources = getInitialCustomSources();
+    setLayers(nextLayers);
+    setLayoutSize(nextLayoutSize);
+    setCustomSources(nextCustomSources);
+    setActiveItemId(nextLayers[0]?.id ?? null);
+  };
+
   const activeLayer = layers.find(l => l.id === activeItemId);
   const activeTileSource = activeLayer?.type === 'tile' && activeLayer.sourceId
     ? getTileSourceFromCatalog(activeLayer.sourceId) ?? null
@@ -481,7 +617,35 @@ export default function App() {
             <h1 className="font-bold text-sm tracking-wide">GIS 高级排版系统</h1>
           </div>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2">
+          <input
+            ref={projectFileInputRef}
+            type="file"
+            accept=".maplayout.json,.json"
+            className="hidden"
+            onChange={handleProjectUpload}
+          />
+          <button
+            onClick={saveProject}
+            className="flex items-center gap-2 bg-[#2A2D35] hover:bg-[#3B82F6] text-white px-3 py-1.5 rounded text-xs font-medium transition-all focus:ring-2 focus:ring-[#3B82F6]/50"
+          >
+            <Save size={14} />
+            保存工程
+          </button>
+          <button
+            onClick={() => projectFileInputRef.current?.click()}
+            className="flex items-center gap-2 bg-[#2A2D35] hover:bg-[#3B82F6] text-white px-3 py-1.5 rounded text-xs font-medium transition-all focus:ring-2 focus:ring-[#3B82F6]/50"
+          >
+            <FolderOpen size={14} />
+            打开工程
+          </button>
+          <button
+            onClick={resetProject}
+            className="flex items-center gap-2 bg-[#2A2D35] hover:bg-[#ef4444] text-white px-3 py-1.5 rounded text-xs font-medium transition-all focus:ring-2 focus:ring-[#ef4444]/50"
+          >
+            <RotateCcw size={14} />
+            重置
+          </button>
           <button 
             onClick={exportAsImage}
             disabled={isExporting}
@@ -505,9 +669,36 @@ export default function App() {
               <p className="text-[10px] text-[#3B82F6] font-bold mb-1.5">地图图层 (随地图缩放)</p>
               <p className="text-[9px] text-[#8E9299] mb-1.5">使用地图左上角工具栏绘制标绘和地图文字</p>
               <label className="flex items-center gap-2 text-xs text-[#3B82F6] cursor-pointer hover:underline">
-                <Upload size={14} /> 导入 KML 边界
-                <input type="file" accept=".kml" className="hidden" onChange={handleKmlUpload} />
+                <Upload size={14} /> 导入数据
+                <input type="file" accept=".kml,.geojson,.json,.zip" className="hidden" onChange={handleDataUpload} />
               </label>
+              <div className="grid grid-cols-2 gap-2 mt-2">
+                <div>
+                  <label className="text-[9px] text-[#8E9299] block mb-1">SHP 编码</label>
+                  <select
+                    value={shapefileEncoding}
+                    onChange={(e) => setShapefileEncoding(e.target.value as DbfEncodingMode)}
+                    className="w-full bg-[#1F2128] border border-[#2A2D35] text-[10px] text-white p-1.5 rounded outline-none focus:border-[#3B82F6]"
+                  >
+                    <option value="auto">自动/GB18030</option>
+                    <option value="gb18030">GB18030</option>
+                    <option value="gbk">GBK</option>
+                    <option value="utf-8">UTF-8</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-[9px] text-[#8E9299] block mb-1">SHP 坐标</label>
+                  <select
+                    value={shapefileProjection}
+                    onChange={(e) => setShapefileProjection(e.target.value as ShapefileProjectionMode)}
+                    className="w-full bg-[#1F2128] border border-[#2A2D35] text-[10px] text-white p-1.5 rounded outline-none focus:border-[#3B82F6]"
+                  >
+                    <option value="auto">自动识别</option>
+                    <option value="wgs84">WGS84</option>
+                    <option value="cgcs2000">CGCS2000</option>
+                  </select>
+                </div>
+              </div>
               <button
                 onClick={() => setIsSourceManagerOpen(true)}
                 className="flex items-center gap-2 text-xs text-[#3B82F6] cursor-pointer hover:underline mt-2"
@@ -600,6 +791,7 @@ export default function App() {
                         name: name,
                         visible: true,
                         type: 'vector',
+                        sourceType: 'draw',
                         shape: shape,
                         vectorStyle: defaultStyle,
                         textStyle: shape === 'Text' ? {
@@ -788,13 +980,67 @@ export default function App() {
               <label className="text-[10px] text-[#8E9299] block mb-2">画布尺寸 / 导出分辨率</label>
               <select 
                 value={layoutSize.id}
-                onChange={(e) => setLayoutSize(PAGE_SIZES.find(s => s.id === e.target.value) || PAGE_SIZES[3])}
+                onChange={(e) => {
+                  const nextSize = PAGE_SIZES.find(s => s.id === e.target.value) || PAGE_SIZES[3];
+                  if (nextSize.id === 'Custom') {
+                    const customBase = layoutSize.id === 'Custom' ? layoutSize : PAGE_SIZES[3];
+                    setLayoutSize({
+                      ...customBase,
+                      id: 'Custom',
+                      label: getCustomLayoutLabel(customBase.w, customBase.h),
+                    });
+                  } else {
+                    setLayoutSize(nextSize);
+                  }
+                }}
                 className="w-full bg-[#1F2128] border border-[#2A2D35] text-xs text-white p-2 rounded outline-none focus:border-[#3B82F6]"
               >
                 {PAGE_SIZES.map(s => (
                   <option key={s.id} value={s.id}>{s.label}</option>
                 ))}
               </select>
+              {layoutSize.id === 'Custom' && (
+                <div className="grid grid-cols-2 gap-2 mt-2">
+                  <div>
+                    <label className="text-[10px] text-[#8E9299] block mb-1">宽度</label>
+                    <input
+                      type="number"
+                      min="300"
+                      max="6000"
+                      step="10"
+                      value={layoutSize.w}
+                      onChange={(e) => {
+                        const w = clampCanvasSize(Number(e.target.value));
+                        setLayoutSize({
+                          ...layoutSize,
+                          w,
+                          label: getCustomLayoutLabel(w, layoutSize.h),
+                        });
+                      }}
+                      className="w-full bg-[#1F2128] border border-[#2A2D35] rounded p-1.5 text-xs text-white focus:border-[#3B82F6] outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-[#8E9299] block mb-1">高度</label>
+                    <input
+                      type="number"
+                      min="300"
+                      max="6000"
+                      step="10"
+                      value={layoutSize.h}
+                      onChange={(e) => {
+                        const h = clampCanvasSize(Number(e.target.value));
+                        setLayoutSize({
+                          ...layoutSize,
+                          h,
+                          label: getCustomLayoutLabel(layoutSize.w, h),
+                        });
+                      }}
+                      className="w-full bg-[#1F2128] border border-[#2A2D35] rounded p-1.5 text-xs text-white focus:border-[#3B82F6] outline-none"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="h-px bg-[#2A2D35]"></div>
@@ -1233,6 +1479,13 @@ export default function App() {
                         className="w-full bg-[#1F2128] border border-[#2A2D35] rounded p-2 text-xs text-white focus:border-[#3B82F6] outline-none"
                       />
                     </div>
+                    {activeLayer.sourceType === 'shapefile' && (
+                      <div className="bg-[#1F2128] border border-[#2A2D35] rounded p-2 text-[10px] text-[#8E9299] leading-relaxed">
+                        <div>数据格式：Shapefile zip</div>
+                        <div>DBF 编码：{activeLayer.dbfEncoding || '未记录'}</div>
+                        <div>坐标识别：{activeLayer.sourceProjection || '未记录'}</div>
+                      </div>
+                    )}
                     {activeLayer.type === 'tile' && (
                       <div>
                         {activeTileSource ? (
